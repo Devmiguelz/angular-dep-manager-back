@@ -1,0 +1,16 @@
+{
+  "visits": 0,
+  "analysisRuns": 0,
+  "packageAnalyzed": 0,
+  "outdatedFound": 0,
+  "overridesDetected": 0,
+  "auditFilesLoaded": 0,
+  "exportsDownloaded": 0,
+  "exportsCopied": 0,
+  "reportDownloaded": 0,
+  "reportCopied": 0,
+  "byAngularVersion": {},
+  "byExportMode": { "updated": 0, "latest": 0, "overrides": 0 },
+  "bySeverity": { "critical": 0, "high": 0, "moderate": 0, "low": 0 },
+  "history": []
+}
