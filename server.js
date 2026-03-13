@@ -151,6 +151,67 @@ app.post('/event', (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/reset', (req, res) => {
+  if (req.headers['x-secret-key'] !== SECRET_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  stats = {
+    visits: 0, analysisRuns: 0, packageAnalyzed: 0,
+    outdatedFound: 0, overridesDetected: 0, auditFilesLoaded: 0,
+    exportsDownloaded: 0, exportsCopied: 0, reportDownloaded: 0, reportCopied: 0,
+    byAngularVersion: {}, byExportMode: { updated: 0, latest: 0, overrides: 0 },
+    bySeverity: { critical: 0, high: 0, moderate: 0, low: 0 },
+    history: []
+  };
+  saveStats();
+  res.json({ ok: true, message: 'Stats reseteadas' });
+});
+
+// ─── POST /audit — proxy hacia npm audit API ──────────────────────────────────
+// El cliente manda su package.json y este endpoint lo reenvía a npm
+app.post('/audit', async (req, res) => {
+  if (!auth(req, res)) return;
+ 
+  const { name, version, dependencies, devDependencies } = req.body;
+  if (!dependencies && !devDependencies) {
+    return res.status(400).json({ error: 'Missing dependencies' });
+  }
+ 
+  // Construir payload en el formato que espera npm
+  const requires = {};
+  const deps = {};
+  for (const [pkg, ver] of Object.entries(dependencies || {})) {
+    requires[pkg] = ver;
+    deps[pkg] = { version: ver.replace(/[\^~>=<]/g, '').trim() };
+  }
+  for (const [pkg, ver] of Object.entries(devDependencies || {})) {
+    requires[pkg] = ver;
+    deps[pkg] = { version: ver.replace(/[\^~>=<]/g, '').trim() };
+  }
+ 
+  const payload = {
+    name:         name || 'project',
+    version:      version || '0.0.0',
+    requires,
+    dependencies: deps
+  };
+ 
+  try {
+    const npmRes = await fetch('https://registry.npmjs.org/-/npm/v1/security/audits/quick', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload)
+    });
+    if (!npmRes.ok) {
+      return res.status(npmRes.status).json({ error: `npm audit respondió ${npmRes.status}` });
+    }
+    const data = await npmRes.json();
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'No se pudo contactar npm audit: ' + err.message });
+  }
+});
+
 // ─── GET /health ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
