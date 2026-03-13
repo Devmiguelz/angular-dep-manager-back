@@ -4,15 +4,15 @@ const path    = require('path');
 const cors    = require('cors');
 
 const app        = express();
-const PORT       = process.env.PORT || 3000;
-const SECRET_KEY = process.env.SECRET_KEY   || 'dev-secret';
-const ORIGIN     = process.env.ALLOWED_ORIGIN || 'https://devmiguelz.github.io';
+const PORT       = process.env.PORT;
+const SECRET_KEY = process.env.SECRET_KEY;
+const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGINS || 'https://devmiguelz.github.io').split(',').map(o => o.trim());
 const STATS_FILE = path.join(__dirname, 'stats.json');
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || origin.startsWith(ORIGIN)) return cb(null, true);
+    if (!origin || ALLOWED_ORIGIN.includes(origin)) return cb(null, true);
     cb(new Error('CORS blocked: ' + origin));
   }
 }));
