@@ -10,7 +10,7 @@ Backend de estadísticas para https://devmiguelz.github.io/angular-dep-manager/
 |---|---|
 | `server.js` | API Express (sube esto a Render) |
 | `package.json` | Dependencias del servidor |
-| `stats.json` | Base de datos en disco (se crea automáticamente) |
+| `.env` | Variables de entorno locales (no subir a Git) |
 | `stats-client.js` | Snippet para pegar en tu index.html |
 
 ---
@@ -18,10 +18,17 @@ Backend de estadísticas para https://devmiguelz.github.io/angular-dep-manager/
 ## Deploy en Render
 
 ### Paso 1 — Repo GitHub
-Crea un repo nuevo (puede ser privado) y sube `server.js`, `package.json` y `stats.json`.
+Crea un repo nuevo (puede ser privado) y sube `server.js` y `package.json`.
+> ⚠️ **No subas `.env`** — agrégalo a `.gitignore`.
 
-### Paso 2 — Nuevo Web Service en Render
-- render.com → **New** → **Web Service**
+### Paso 2 — Base de datos PostgreSQL
+- Render → **New** → **PostgreSQL**
+- Anota el **Internal Database URL** que Render te asigna
+
+Las tablas (`stats` e `history`) se crean automáticamente al arrancar el servidor.
+
+### Paso 3 — Nuevo Web Service en Render
+- Render → **New** → **Web Service**
 - Conecta el repo
 - Configura:
   - **Runtime:** Node
@@ -29,16 +36,44 @@ Crea un repo nuevo (puede ser privado) y sube `server.js`, `package.json` y `sta
   - **Start Command:** `npm start`
   - **Plan:** Free (o Starter si no quieres cold starts)
 
-### Paso 3 — Variables de entorno
+### Paso 4 — Variables de entorno
 En Render → Settings → **Environment Variables**:
 
 | Variable | Valor ejemplo |
 |---|---|
 | `SECRET_KEY` | `m1Cl4v3S3cr3t4MuyLarga2024` |
-| `ALLOWED_ORIGIN` | `https://devmiguelz.github.io` |
+| `ALLOWED_ORIGINS` | `https://devmiguelz.github.io` |
+| `DATABASE_URL` | Internal URL de tu PostgreSQL en Render |
 
-### Paso 4 — Copiar la URL
+> Usa siempre la **conexión interna** de Render en producción — es más rápida y sin costo de egress.
+
+### Paso 5 — Copiar la URL
 Render te asigna algo como: `https://angular-dep-stats.onrender.com`
+
+---
+
+## Desarrollo local
+
+Crea un archivo `.env` en la raíz del proyecto:
+
+```env
+PORT=3000
+SECRET_KEY=m1Cl4v3S3cr3t4MuyLarga2024
+ALLOWED_ORIGINS=https://devmiguelz.github.io
+DATABASE_URL=postgresql://user:password@host/dbname
+```
+
+Para arrancar el servidor en local:
+
+```bash
+# Node 20+
+node --env-file=.env server.js
+
+# Node < 20 (requiere dotenv instalado)
+npm install dotenv
+# agregar require('dotenv').config(); al inicio de server.js
+node server.js
+```
 
 ---
 
@@ -79,13 +114,21 @@ Render te asigna algo como: `https://angular-dep-stats.onrender.com`
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
 | `GET` | `/stats` | No | Lee las estadísticas públicas |
+| `GET` | `/stats/history` | No | Análisis agrupados por día (últimos 60 días) |
 | `POST` | `/event` | `x-secret-key` header | Registra un evento |
+| `POST` | `/reset` | `x-secret-key` header | Resetea todas las estadísticas |
+| `POST` | `/audit` | `x-secret-key` header | Proxy hacia npm audit API |
 | `GET` | `/health` | No | Health check para Render |
 
 ---
 
-## Nota sobre persistencia
+## Base de datos
 
-El `stats.json` **se borra con cada redeploy** en Render Free.  
-Para persistencia real entre deploys, habilita un **Persistent Disk** en Render (desde $1/mes)  
-o migra el almacenamiento a Supabase / PlanetScale.
+El servidor crea automáticamente dos tablas al iniciar:
+
+| Tabla | Descripción |
+|---|---|
+| `stats` | Clave/valor JSONB con todos los contadores |
+| `history` | Últimas 200 entradas de eventos con timestamp |
+
+La persistencia es total entre redeploys al usar PostgreSQL en Render.
