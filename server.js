@@ -1,13 +1,111 @@
 const express = require('express');
-const fs      = require('fs');
-const path    = require('path');
 const cors    = require('cors');
+const { Pool } = require('pg');
 
 const app        = express();
 const PORT       = process.env.PORT;
 const SECRET_KEY = process.env.SECRET_KEY;
 const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGINS || 'https://devmiguelz.github.io').split(',').map(o => o.trim());
-const STATS_FILE = path.join(__dirname, 'stats.json');
+
+// ─── DB ───────────────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('render.com')
+    ? { rejectUnauthorized: false }
+    : false
+});
+
+// Crear tablas si no existen
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stats (
+      key   TEXT PRIMARY KEY,
+      value JSONB NOT NULL DEFAULT '0'
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS history (
+      id         SERIAL PRIMARY KEY,
+      type       TEXT NOT NULL,
+      ts         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      meta       JSONB NOT NULL DEFAULT '{}'
+    );
+  `);
+
+  // Insertar contadores base si no existen
+  const counters = [
+    'visits','analysisRuns','packageAnalyzed','outdatedFound',
+    'overridesDetected','auditFilesLoaded','exportsDownloaded',
+    'exportsCopied','reportDownloaded','reportCopied','lastSeen',
+    'byAngularVersion','byExportMode','bySeverity'
+  ];
+  const defaults = {
+    visits: 0, analysisRuns: 0, packageAnalyzed: 0, outdatedFound: 0,
+    overridesDetected: 0, auditFilesLoaded: 0, exportsDownloaded: 0,
+    exportsCopied: 0, reportDownloaded: 0, reportCopied: 0, lastSeen: null,
+    byAngularVersion: {}, byExportMode: { updated: 0, latest: 0, overrides: 0 },
+    bySeverity: { critical: 0, high: 0, moderate: 0, low: 0 }
+  };
+  for (const k of counters) {
+    await pool.query(
+      `INSERT INTO stats(key, value) VALUES($1, $2) ON CONFLICT(key) DO NOTHING`,
+      [k, JSON.stringify(defaults[k])]
+    );
+  }
+  console.log('DB initialized');
+}
+
+// ─── Helpers DB ───────────────────────────────────────────────────────────────
+async function getStats() {
+  const { rows } = await pool.query('SELECT key, value FROM stats');
+  const s = {};
+  for (const r of rows) s[r.key] = r.value;
+  return s;
+}
+
+async function setStat(key, value) {
+  await pool.query(
+    `INSERT INTO stats(key, value) VALUES($1, $2)
+     ON CONFLICT(key) DO UPDATE SET value = $2`,
+    [key, JSON.stringify(value)]
+  );
+}
+
+async function incStat(key, by = 1) {
+  await pool.query(
+    `INSERT INTO stats(key, value) VALUES($1, $2)
+     ON CONFLICT(key) DO UPDATE SET value = (COALESCE(stats.value::numeric, 0) + $2)::jsonb`,
+    [key, by]
+  );
+}
+
+async function incJsonKey(statKey, subKey, by = 1) {
+  // Incrementa stats[statKey][subKey] de forma atómica en JSONB
+  await pool.query(
+    `INSERT INTO stats(key, value) VALUES($1, jsonb_build_object($2::text, $3::numeric))
+     ON CONFLICT(key) DO UPDATE
+       SET value = jsonb_set(
+         stats.value,
+         ARRAY[$2::text],
+         (COALESCE(stats.value->$2, '0')::numeric + $3)::text::jsonb
+       )`,
+    [statKey, subKey, by]
+  );
+}
+
+async function addHistory(type, meta) {
+  await pool.query(
+    `INSERT INTO history(type, meta) VALUES($1, $2)`,
+    [type, JSON.stringify(meta)]
+  );
+  // Mantener solo las últimas 200 entradas
+  await pool.query(`
+    DELETE FROM history WHERE id IN (
+      SELECT id FROM history ORDER BY id DESC OFFSET 200
+    )
+  `);
+}
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({
@@ -18,37 +116,7 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function readStats() {
-  try { return JSON.parse(fs.readFileSync(STATS_FILE, 'utf8')); }
-  catch { return defaultStats(); }
-}
-
-function defaultStats() {
-  return {
-    visits:            0,
-    analysisRuns:      0,
-    packageAnalyzed:   0,   // suma total de paquetes procesados
-    outdatedFound:     0,   // suma total de paquetes desactualizados
-    overridesDetected: 0,   // suma total de overrides sugeridos
-    auditFilesLoaded:  0,   // veces que cargaron npm-audit.json
-    exportsDownloaded: 0,
-    exportsCopied:     0,
-    reportDownloaded:  0,
-    reportCopied:      0,
-    // distribuciones para gráficas
-    byAngularVersion:  {},  // { "17": 12, "18": 5 }
-    byExportMode:      { updated: 0, latest: 0, overrides: 0 },
-    bySeverity:        { critical: 0, high: 0, moderate: 0, low: 0 },
-    // historial últimas 200 sesiones
-    history:           []
-  };
-}
-
-function writeStats(data) {
-  fs.writeFileSync(STATS_FILE, JSON.stringify(data, null, 2));
-}
-
+// ─── Auth ─────────────────────────────────────────────────────────────────────
 function auth(req, res) {
   if (req.headers['x-secret-key'] !== SECRET_KEY) {
     res.status(401).json({ error: 'Unauthorized' });
@@ -57,127 +125,118 @@ function auth(req, res) {
   return true;
 }
 
-function inc(obj, key, by = 1) {
-  obj[key] = (obj[key] || 0) + by;
-}
-
 // ─── GET /stats ───────────────────────────────────────────────────────────────
-app.get('/stats', (_req, res) => {
-  const { history, ...pub } = readStats();
-  res.json(pub);
+app.get('/stats', async (_req, res) => {
+  try {
+    const s = await getStats();
+    res.json(s);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// ─── GET /stats/history — análisis agrupados por día (últimos 60 días) ────────
-app.get('/stats/history', (_req, res) => {
-  const { history = [] } = readStats();
-
-  // Agrupar eventos tipo 'analysis' por día
-  const counts = {};
-  history
-    .filter(e => e.type === 'analysis')
-    .forEach(e => {
-      const day = (e.ts || '').slice(0, 10);
-      if (day) counts[day] = (counts[day] || 0) + 1;
-    });
-
-  // Devolver últimos 60 días con fecha + count
-  const byDay = Object.entries(counts)
-    .map(([date, count]) => ({ date, count }))
-    .sort((a, b) => a.date.localeCompare(b.date))
-    .slice(-60);
-
-  res.json({ byDay });
+// ─── GET /stats/history ───────────────────────────────────────────────────────
+app.get('/stats/history', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT DATE(ts)::text AS date, COUNT(*)::int AS count
+      FROM history
+      WHERE type = 'analysis'
+        AND ts >= NOW() - INTERVAL '60 days'
+      GROUP BY DATE(ts)
+      ORDER BY DATE(ts)
+    `);
+    res.json({ byDay: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── POST /event ──────────────────────────────────────────────────────────────
-// Tipos: visit | analysis | auditLoaded | export | report
-app.post('/event', (req, res) => {
+app.post('/event', async (req, res) => {
   if (!auth(req, res)) return;
 
   const { type, meta = {} } = req.body;
   if (!type) return res.status(400).json({ error: 'Missing type' });
 
-  const s = readStats();
+  try {
+    switch (type) {
 
-  switch (type) {
+      case 'visit':
+        await incStat('visits');
+        break;
 
-    case 'visit':
-      s.visits++;
-      break;
+      case 'analysis':
+        await incStat('analysisRuns');
+        if (meta.totalPackages) await incStat('packageAnalyzed',   meta.totalPackages);
+        if (meta.outdated)      await incStat('outdatedFound',      meta.outdated);
+        if (meta.overrides)     await incStat('overridesDetected',  meta.overrides);
+        if (meta.angularVersion) await incJsonKey('byAngularVersion', String(meta.angularVersion));
+        if (meta.bySeverity) {
+          for (const sev of ['critical','high','moderate','low']) {
+            if (meta.bySeverity[sev]) await incJsonKey('bySeverity', sev, meta.bySeverity[sev]);
+          }
+        }
+        break;
 
-    // meta: { project, totalPackages, outdated, angularVersion, hasAudit, overrides, bySeverity }
-    case 'analysis':
-      s.analysisRuns++;
-      s.packageAnalyzed   += meta.totalPackages   || 0;
-      s.outdatedFound     += meta.outdated         || 0;
-      s.overridesDetected += meta.overrides        || 0;
-      if (meta.angularVersion) inc(s.byAngularVersion, meta.angularVersion);
-      if (meta.bySeverity) {
-        ['critical','high','moderate','low'].forEach(sev => {
-          if (meta.bySeverity[sev]) s.bySeverity[sev] += meta.bySeverity[sev];
-        });
-      }
-      break;
+      case 'auditLoaded':
+        await incStat('auditFilesLoaded');
+        break;
 
-    case 'auditLoaded':
-      s.auditFilesLoaded++;
-      break;
+      case 'export':
+        if (meta.action === 'download') await incStat('exportsDownloaded');
+        else                            await incStat('exportsCopied');
+        if (meta.mode) await incJsonKey('byExportMode', meta.mode);
+        break;
 
-    // meta: { mode: 'updated'|'latest'|'overrides', action: 'download'|'copy' }
-    case 'export':
-      if (meta.action === 'download') s.exportsDownloaded++;
-      else                            s.exportsCopied++;
-      if (meta.mode) inc(s.byExportMode, meta.mode);
-      break;
+      case 'report':
+        if (meta.action === 'download') await incStat('reportDownloaded');
+        else                            await incStat('reportCopied');
+        break;
 
-    // meta: { action: 'download'|'copy' }
-    case 'report':
-      if (meta.action === 'download') s.reportDownloaded++;
-      else                            s.reportCopied++;
-      break;
+      default:
+        return res.status(400).json({ error: 'Unknown event type: ' + type });
+    }
 
-    default:
-      return res.status(400).json({ error: 'Unknown event type: ' + type });
+    await setStat('lastSeen', new Date().toISOString());
+    await addHistory(type, meta);
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-
-  s.lastSeen = new Date().toISOString();
-
-  // Historial (últimas 200 entradas)
-  s.history = s.history || [];
-  s.history.push({ type, ts: s.lastSeen, ...meta });
-  if (s.history.length > 200) s.history = s.history.slice(-200);
-
-  writeStats(s);
-  res.json({ ok: true });
 });
 
-app.post('/reset', (req, res) => {
-  if (req.headers['x-secret-key'] !== SECRET_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
+// ─── POST /reset ──────────────────────────────────────────────────────────────
+app.post('/reset', async (req, res) => {
+  if (!auth(req, res)) return;
+  try {
+    const defaults = {
+      visits: 0, analysisRuns: 0, packageAnalyzed: 0, outdatedFound: 0,
+      overridesDetected: 0, auditFilesLoaded: 0, exportsDownloaded: 0,
+      exportsCopied: 0, reportDownloaded: 0, reportCopied: 0, lastSeen: null,
+      byAngularVersion: {}, byExportMode: { updated: 0, latest: 0, overrides: 0 },
+      bySeverity: { critical: 0, high: 0, moderate: 0, low: 0 }
+    };
+    for (const [k, v] of Object.entries(defaults)) {
+      await setStat(k, v);
+    }
+    await pool.query('DELETE FROM history');
+    res.json({ ok: true, message: 'Stats reseteadas' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  stats = {
-    visits: 0, analysisRuns: 0, packageAnalyzed: 0,
-    outdatedFound: 0, overridesDetected: 0, auditFilesLoaded: 0,
-    exportsDownloaded: 0, exportsCopied: 0, reportDownloaded: 0, reportCopied: 0,
-    byAngularVersion: {}, byExportMode: { updated: 0, latest: 0, overrides: 0 },
-    bySeverity: { critical: 0, high: 0, moderate: 0, low: 0 },
-    history: []
-  };
-  saveStats();
-  res.json({ ok: true, message: 'Stats reseteadas' });
 });
 
-// ─── POST /audit — proxy hacia npm audit API ──────────────────────────────────
-// El cliente manda su package.json y este endpoint lo reenvía a npm
+// ─── POST /audit ──────────────────────────────────────────────────────────────
 app.post('/audit', async (req, res) => {
   if (!auth(req, res)) return;
- 
+
   const { name, version, dependencies, devDependencies } = req.body;
   if (!dependencies && !devDependencies) {
     return res.status(400).json({ error: 'Missing dependencies' });
   }
- 
-  // Construir payload en el formato que espera npm
+
   const requires = {};
   const deps = {};
   for (const [pkg, ver] of Object.entries(dependencies || {})) {
@@ -188,14 +247,14 @@ app.post('/audit', async (req, res) => {
     requires[pkg] = ver;
     deps[pkg] = { version: ver.replace(/[\^~>=<]/g, '').trim() };
   }
- 
+
   const payload = {
     name:         name || 'project',
     version:      version || '0.0.0',
     requires,
     dependencies: deps
   };
- 
+
   try {
     const npmRes = await fetch('https://registry.npmjs.org/-/npm/v1/security/audits/quick', {
       method:  'POST',
@@ -205,8 +264,7 @@ app.post('/audit', async (req, res) => {
     if (!npmRes.ok) {
       return res.status(npmRes.status).json({ error: `npm audit respondió ${npmRes.status}` });
     }
-    const data = await npmRes.json();
-    res.json(data);
+    res.json(await npmRes.json());
   } catch (err) {
     res.status(502).json({ error: 'No se pudo contactar npm audit: ' + err.message });
   }
@@ -215,4 +273,7 @@ app.post('/audit', async (req, res) => {
 // ─── GET /health ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-app.listen(PORT, () => console.log(`Stats server running on :${PORT}`));
+// ─── Arranque ─────────────────────────────────────────────────────────────────
+initDB()
+  .then(() => app.listen(PORT, () => console.log(`Stats server running on :${PORT}`)))
+  .catch(err => { console.error('DB init failed:', err); process.exit(1); });
