@@ -74,21 +74,21 @@ async function setStat(key, value) {
 
 async function incStat(key, by = 1) {
   await pool.query(
-    `INSERT INTO stats(key, value) VALUES($1, $2)
-     ON CONFLICT(key) DO UPDATE SET value = (COALESCE(stats.value::numeric, 0) + $2)::jsonb`,
+    `INSERT INTO stats(key, value) VALUES($1, to_jsonb($2::numeric))
+     ON CONFLICT(key) DO UPDATE
+       SET value = to_jsonb(COALESCE(stats.value::text::numeric, 0) + $2::numeric)`,
     [key, by]
   );
 }
 
 async function incJsonKey(statKey, subKey, by = 1) {
-  // Incrementa stats[statKey][subKey] de forma atómica en JSONB
   await pool.query(
     `INSERT INTO stats(key, value) VALUES($1, jsonb_build_object($2::text, $3::numeric))
      ON CONFLICT(key) DO UPDATE
        SET value = jsonb_set(
          stats.value,
          ARRAY[$2::text],
-         (COALESCE(stats.value->$2, '0')::numeric + $3)::text::jsonb
+         to_jsonb(COALESCE((stats.value->$2)::text::numeric, 0) + $3::numeric)
        )`,
     [statKey, subKey, by]
   );
